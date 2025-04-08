@@ -1,0 +1,1 @@
+Ceci est un fichier d'exemple pour tester le téléchargement et le stockage dans un bucket S3.

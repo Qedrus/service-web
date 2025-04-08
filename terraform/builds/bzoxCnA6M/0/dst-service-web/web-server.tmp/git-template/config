@@ -1,0 +1,10 @@
+[init]
+	defaultBranch = none
+[fetch]
+	recurseSubmodules = false
+[credential]
+	interactive = never
+[transfer]
+	bundleURI = true
+[http "https://gitlab.com"]
+	sslCAInfo = /home/ubuntu/projet-fil-rouge/web-server/terraform/builds/bzoxCnA6M/0/dst-service-web/web-server.tmp/CI_SERVER_TLS_CA_FILE

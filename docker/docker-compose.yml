@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  wordpress:
+    build: ./wordpress
+    container_name: wordpress
+    restart: always
+    depends_on:
+      - db
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: admin
+      WORDPRESS_DB_PASSWORD: password
+      WORDPRESS_DB_NAME: storedb
+    networks:
+      - wp_network
+    ports:
+      - "8080:80"  # WordPress accessible sur http://localhost:8080
+
+  db:
+    build: ./mariadb
+    container_name: db
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=password
+      - MYSQL_DATABASE=storedb
+      - MYSQL_USER=admin
+      - MYSQL_PASSWORD=password
+    ports:
+      - "3306:3306"
+    networks:
+      - wp_network
+  
+  nginx:
+    build: ./nginx
+    container_name: nginx_proxy
+    restart: always
+    depends_on:
+      - wordpress
+    networks:
+      - wp_network
+    ports:
+      - "80:80"  # NGINX écoute sur le port 80
+
+volumes:
+  mariadb_data:
+
+networks:
+  wp_network:
+    driver: bridge

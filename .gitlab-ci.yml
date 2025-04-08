@@ -1,0 +1,212 @@
+stages:
+  - build
+  - push
+  - deploy
+  - verify
+  - verify_monitoring
+  - validate
+  - plan
+  - apply
+  - destroy
+
+variables:
+  TF_ROOT: terraform/
+  K3S_ROOT: kubernetes/
+  AWS_DEFAULT_REGION: eu-west-3
+  CLUSTER_NAME: "my-cluster"
+
+# Docker configuration template
+.default-docker:
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKER_USERNAME" --password-stdin
+
+# Terraform configuration template
+.tf-config:
+  image:
+    name: hashicorp/terraform:1.10.5
+    entrypoint: [""]
+  before_script:
+    - apk update && apk add curl
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" > ~/.ssh/eks-keypair
+    - echo "$SSH_PUBLIC_KEY" > ~/.ssh/eks-keypair.pub
+    - chmod 600 ~/.ssh/eks-keypair*
+    - cd ${TF_ROOT}
+    - terraform version
+
+# Kubernetes EKS configuration template (pour déployer et vérifier via kubectl)
+.k8s-eks-config:
+  image:
+    name: amazon/aws-cli:2.13.22
+    entrypoint: [""]
+  before_script:
+    - apt-get update && apt-get install -y git
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - mkdir -p ~/bin
+    - install -m 0755 kubectl ~/bin/kubectl
+    - export PATH="$HOME/bin:$PATH"
+    - aws configure set aws_access_key_id ${AWS_ACCESS_KEY_ID}
+    - aws configure set aws_secret_access_key ${AWS_SECRET_ACCESS_KEY}
+    - aws configure set region ${AWS_DEFAULT_REGION}
+    - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_DEFAULT_REGION}
+    - kubectl cluster-info
+
+# Build des images Docker
+build:
+  stage: build
+  extends: .default-docker
+  script:
+    - docker build -t didyyi/my-wordpress ./docker/wordpress
+    - docker build -t didyyi/my-mariadb ./docker/mariadb
+    - docker build -t didyyi/my-nginx ./docker/nginx
+    - docker save didyyi/my-wordpress -o my-wordpress.tar
+    - docker save didyyi/my-mariadb -o my-mariadb.tar
+    - docker save didyyi/my-nginx -o my-nginx.tar
+  artifacts:
+    paths:
+      - my-wordpress.tar
+      - my-nginx.tar
+      - my-mariadb.tar
+  rules:
+    - if: $CI_COMMIT_BRANCH == "mainnn"
+
+# Push des images sur Docker Hub
+push:
+  stage: push
+  extends: .default-docker
+  script:
+    - docker load -i my-wordpress.tar
+    - docker load -i my-nginx.tar
+    - docker load -i my-mariadb.tar
+    - docker push didyyi/my-wordpress
+    - docker push didyyi/my-nginx
+    - docker push didyyi/my-mariadb
+  dependencies:
+    - build
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "mainn"
+
+# Déploiement sur EKS
+deploy:
+  extends: .k8s-eks-config
+  stage: deploy
+  timeout: 20m
+  script:
+    - cd ${K3S_ROOT}
+    # Installer le CSI driver via Kustomize
+    - kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.28"
+    - sleep 10
+    - kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-ebs-csi-driver
+    - kubectl get storageclass
+    - kubectl delete storageclass ebs-sc --ignore-not-found
+    # Supprimer l'ancien StorageClass et PVC (s'ils existent)
+    #- kubectl delete storageclass ebs-sc --ignore-not-found
+    #- kubectl delete pvc mariadb-pvc --force --grace-period=0 || true
+    - kubectl delete all --all
+    # Créer le StorageClass pour le CSI driver
+    - kubectl apply -f storageclass-ebs.yaml
+    # Déployer les ressources applicatives
+    - kubectl apply -f wordpress.yaml
+    - kubectl apply -f nginx.yaml
+    - kubectl apply -f mariadb.yaml
+    # Vérifications initiales
+    - echo "Vérification des PVC..."
+    - kubectl get storageclass
+    - kubectl describe pvc mariadb-pvc
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Job de vérification (sans redéploiement)
+verify_resources:
+  stage: verify
+  extends: .k8s-eks-config
+  script:
+    - echo "Vérification de l'état des PVC..."
+    - kubectl get pvc
+    - kubectl describe pvc mariadb-pvc
+    - echo "Vérification de l'état des pods..."
+    - kubectl get pods
+    - echo "Vérification des nœuds..."
+    - kubectl wait --for=condition=Ready pods --all --timeout=300s
+
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  when: manual  # Exécute ce job à la demande si besoin
+verify_monitoring:
+  stage: verify
+  extends: .k8s-eks-config
+  script:
+    - |
+      # Récupération des URLs avec timeout et vérification AWS
+      echo "Vérification du provisioning des Load Balancers..."
+
+      # Récupération des URLs
+      export PROMETHEUS_URL=$(kubectl get svc -n monitoring kube-prometheus-stack-prometheus -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+      export GRAFANA_URL=$(kubectl get svc -n monitoring kube-prometheus-stack-grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+      echo "Prometheus URL: http://${PROMETHEUS_URL}:9090"
+      echo "Grafana URL: http://${GRAFANA_URL}"
+
+      # Tests de connexion avec retry
+      echo "Test de connexion à Prometheus..."
+      curl --retry 5 --retry-delay 10 --retry-max-time 60 --fail -sI "http://${PROMETHEUS_URL}:9090/-/healthy"
+
+      echo "Test de connexion à Grafana..."
+      curl --retry 5 --retry-delay 10 --retry-max-time 60 --fail -sI "http://${GRAFANA_URL}/api/health"
+      
+      echo "Monitoring vérifié avec succès !"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+# Terraform : Validate
+validate:
+  stage: validate
+  script:
+    - cd ${TF_ROOT}
+    - terraform fmt -check -recursive
+    - terraform init -backend=false
+    - terraform validate
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Terraform : Plan
+plan:
+  stage: plan
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform plan -out=tfplan
+    - terraform show -no-color tfplan
+  artifacts:
+    paths:
+      - ${TF_ROOT}/tfplan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+# Terraform : Apply (manual)
+apply:
+  stage: apply
+  script:
+    - cd ${TF_ROOT}
+    - terraform init
+    - terraform apply -auto-approve tfplan
+  when: manual
+  dependencies:
+    - plan
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  allow_failure: true
+
+# Terraform : Destroy (manual)
+destroy:
+  stage: destroy
+  script:
+    - terraform init
+    - terraform destroy -auto-approve
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  allow_failure: true
